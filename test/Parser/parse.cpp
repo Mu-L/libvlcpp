@@ -1,5 +1,5 @@
 /*****************************************************************************
- * parse.cpp: Parser::queue regression test
+ * parse.cpp: Parser parse task regression test
  *****************************************************************************
  * Copyright © 2026 libvlcpp authors & VideoLAN
  *
@@ -27,6 +27,7 @@
 #include <memory>
 #include <mutex>
 #include <iostream>
+#include <utility>
 
 int main(int ac, char** av)
 {
@@ -51,25 +52,28 @@ int main(int ac, char** av)
     std::atomic<int64_t> reportedDuration{-1};
     std::mutex stateMutex;
     std::condition_variable stateCv;
-    std::unique_ptr<VLC::Parser::TaskIdentifier> queuedTaskId;
+    VLC::Parser::TaskIdentifier expectedId;
 
-    VLC::Parser::Callbacks cbs([&](VLC::Parser::Task&& task, VLC::Parser::Status status) {
+    VLC::Parser::Callbacks cbs([&](VLC::Parser::TaskIdentifier task, VLC::Parser::Status status) {
         std::lock_guard<std::mutex> lk(stateMutex);
-        assert(*queuedTaskId == task);
-        auto media = task.getMedia();
-        assert(media.isValid());
+        assert(task == expectedId);
         reportedDuration.store(media.duration().count());
         parserStatus = status;
         parsingFinished = true;
         stateCv.notify_all();
     });
 
-    /* block until the parsing is done. Hold stateMutex across queue() so the
-       callback (which also locks stateMutex) cannot observe queuedTaskId
-       before we assign it */
+    /* the task identifier is fetched before submission, so the callback can
+       safely compare against it even if it fires before submit() returns */
+    auto task = parser.createParseTask(req, cbs);
+    expectedId = task.id();
+    auto submitted = parser.submit(std::move(task));
+    assert(submitted.id() == expectedId);
+    assert(submitted.getMedia() == media);
+
+    /* block until the parsing is done */
     {
         std::unique_lock<std::mutex> lk(stateMutex);
-        queuedTaskId.reset(new VLC::Parser::TaskIdentifier(parser.queue(req, cbs)));
         assert(stateCv.wait_for(lk, std::chrono::seconds(5),
                                 [&] { return parsingFinished; }));
     }

@@ -1,5 +1,5 @@
 /*****************************************************************************
- * thumbnail.cpp: Parser::queueThumbnailing regression test
+ * thumbnail.cpp: Parser thumbnail task regression test
  *****************************************************************************
  * Copyright © 2026 libvlcpp authors & VideoLAN
  *
@@ -53,7 +53,7 @@ int main(int ac, char** av)
     bool pictureReceived = false;
 
     VLC::Parser::ThumbnailerCallbacks thumbCbs(
-        [&](VLC::Parser::Task&& task, const VLC::Picture& picture) {
+        [&](VLC::Parser::TaskIdentifier, const VLC::Picture& picture) {
             assert(picture.isValid());
             std::lock_guard<std::mutex> lk(mtx);
             captured = picture;
@@ -62,7 +62,7 @@ int main(int ac, char** av)
         }
     );
 
-    parser.queueThumbnailing(thumbReq, thumbCbs);
+    parser.submit(parser.createThumbnailTask(thumbReq, thumbCbs));
 
     /* block until the thumbnail is received and verify some of its properties,
        then save it to a file and verify the file is non-empty before cleaning up */

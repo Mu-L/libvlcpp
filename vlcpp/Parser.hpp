@@ -42,79 +42,150 @@ public:
         Done = libvlc_parser_status_done,
     };
 
-    class Task : public Internal<libvlc_parser_task>
-    {
-    private:
-        explicit Task( libvlc_parser_task *task ) : Internal( task, libvlc_parser_task_release )
-        {
-        }
+    class Task;
+    class SubmittedTask;
 
-    public:
-        /**
-         * Fetch the media associated with the task handle.
-         *
-         * \return the media associated with the task
-         */
-        Media getMedia() const
-        {
-            auto media = libvlc_parser_task_get_media( *this );
-            return Media( media, true );
-        }
-
-        template <size_t, typename ...>
-        friend struct CallbackWrapper;
-    };
-
+    /**
+     * Identifier of a parsing/thumbnailing task.
+     *
+     * Returned by Task::id() and SubmittedTask::id(), and passed to the parser
+     * and thumbnailer callbacks, to identify which task a callback refers to.
+     * It is a plain value that can be copied and compared with other identifiers.
+     *
+     * \warning An identifier is only unique while the task it identifies is
+     * alive, i.e. while a Task or SubmittedTask referring to it exists, or while
+     * one of its callbacks runs. Once the task is released, a new task may get
+     * the same identifier.
+     *
+     * \note A default constructed identifier doesn't identify any task. It is also
+     * returned by a Task that was submitted or moved from.
+     */
     class TaskIdentifier
     {
     private:
-        libvlc_parser_task *m_task;
+        std::uintptr_t m_id = 0;
 
         explicit TaskIdentifier( libvlc_parser_task *task )
-            : m_task( task )
+            : m_id( reinterpret_cast<std::uintptr_t>( task ) )
         {
         }
 
     public:
-        friend bool operator==( const TaskIdentifier& id, const Task& task )
+        TaskIdentifier() = default;
+
+        bool operator==( const TaskIdentifier& another ) const
         {
-            return id.m_task == task.get();
+            return m_id == another.m_id;
         }
 
-        friend bool operator==( const Task& task, const TaskIdentifier& id )
-        {
-            return id == task;
-        }
-
-        bool operator==(const TaskIdentifier& another) const
-        {
-            return m_task == another.m_task;
-        }
-
-        /**
-         * Fetch the media associated with the task handle.
-         *
-         * \return the media associated with the task
-         */
-        Media getMedia() const
-        {
-            auto media = libvlc_parser_task_get_media( m_task );
-            return Media( media, true );
-        }
-
-        friend class Parser;
+        friend class Task;
+        friend class SubmittedTask;
         template <size_t, typename ...>
         friend struct CallbackWrapper;
     };
 
     /**
+     * Owning handle of a submitted parsing/thumbnailing task.
+     *
+     * Returned by Parser::submit(). It can be used to cancel the task and to
+     * fetch its media. The underlying task is released when the last copy of
+     * this object is destroyed. Releasing it while the task is running is
+     * safe, libVLC keeps the task alive until its completion callback returns.
+     */
+    class SubmittedTask : public Internal<libvlc_parser_task>
+    {
+    private:
+        explicit SubmittedTask( Pointer task )
+        {
+            m_obj = std::move( task );
+        }
+
+    public:
+        /**
+         * Get the identifier of the task.
+         *
+         * \return the identifier of the task, the same one returned by the
+         * Task it was submitted from and passed to its callbacks, or a
+         * default constructed identifier if this handle is empty
+         */
+        TaskIdentifier id() const
+        {
+            return TaskIdentifier( get() );
+        }
+
+        /**
+         * Fetch the media associated with the task handle.
+         *
+         * \return the media associated with the task, or an empty Media if
+         * this handle is empty
+         */
+        Media getMedia() const
+        {
+            if ( !isValid() )
+                return Media();
+            auto media = libvlc_parser_task_get_media( *this );
+            return Media( media, true );
+        }
+
+        friend class Parser;
+    };
+
+    /**
+     * A created task that has not been submitted yet.
+     *
+     * Returned by Parser::createParseTask() and Parser::createThumbnailTask(),
+     * and started by passing it to Parser::submit(), which consumes it on
+     * success. It can't be copied, so a task that was submitted successfully
+     * can't be submitted again. Destroying it without submitting it releases
+     * the task, and no callback is invoked for it.
+     */
+    class Task
+    {
+    private:
+        /* Identifies the parser that created the task without owning it.
+           It doesn't keep the parser that created it alive. If that parser is
+           destroyed first, the task can no longer be submitted, only released. */
+        std::weak_ptr<libvlc_parser_t> m_parser;
+        std::shared_ptr<libvlc_parser_task> m_task;
+
+        Task( const std::shared_ptr<libvlc_parser_t>& parser, libvlc_parser_task *task )
+            : m_parser( parser )
+            , m_task( task, libvlc_parser_task_release )
+        {
+        }
+
+    public:
+        Task( Task&& ) = default;
+        Task& operator=( Task&& ) = default;
+        Task( const Task& ) = delete;
+        Task& operator=( const Task& ) = delete;
+
+        /**
+         * Get the identifier of the task.
+         *
+         * The completion callback may run before Parser::submit() returns,
+         * so fetch the identifier before submitting the task to identify it
+         * in its callbacks.
+         *
+         * \return the identifier of the task, or a default constructed
+         * identifier if this object was submitted or moved from
+         */
+        TaskIdentifier id() const
+        {
+            return TaskIdentifier( m_task.get() );
+        }
+
+        friend class Parser;
+    };
+
+    /**
      * Callback prototype that notifies when a parser request finishes
      *
-     * \param task opaque handle of the task that finished, can be compared to the TaskIdentifier
-     * returned by Parser::queue() using operator==, to identify which task finished
+     * \param task identifier of the task that finished, can be compared with the one returned by
+     * Task::id() and SubmittedTask::id(), to identify which task finished
      * \param status terminal parse outcome, \ref Parser::Status
      */
-    using ExpectedOnParsedCb = void(Parser::Task&& task, Parser::Status status);
+    using ExpectedOnParsedCb = void(Parser::TaskIdentifier task, Parser::Status status);
 
     /**
      * Callback prototype that notify when the parser add new attachments to
@@ -122,8 +193,8 @@ public:
      *
      * Called before onParsed, if there are valid attachments.
      *
-     * \param task opaque handle of the task, can be compared to the TaskIdentifier
-     * returned by Parser::queue() using operator==, to identify which task added attachments
+     * \param task identifier of the task, can be compared with the one returned by
+     * Task::id() and SubmittedTask::id(), to identify which task added attachments
      * \param list list of pictures, the list is only valid from this
      * callback, each pictures can be held separately with list.at(index) method
      */
@@ -132,14 +203,14 @@ public:
     /**
      * Callback prototype that notify when a thumbnailer request finishes
      *
-     * \param task opaque handle of the task that finished, can be compared to the TaskIdentifier
-     * returned by Parser::queueThumbnailing() using operator==, to identify which task finished
+     * \param task identifier of the task that finished, can be compared with the one returned by
+     * Task::id() and SubmittedTask::id(), to identify which task finished
      * \param picture generated thumbnail, the thumbnail is only valid for the duration
      * of the callback, but can be safely copied if needed. It is an empty Picture object in case
      * of an error, timeout or request was cancelled. User should check if the Picture is valid by
      * calling picture.isValid()
      */
-    using ExpectedOnThumbnailerEndedCb = void(Parser::Task&& task, const Picture& picture);
+    using ExpectedOnThumbnailerEndedCb = void(Parser::TaskIdentifier task, const Picture& picture);
 
     enum class ParseFlags
     {
@@ -239,7 +310,7 @@ public:
          *
          * \param media the media to parse
          *
-         * \warning The media object must remain valid until the parser request is queued.
+         * \warning The media object must remain valid until the parser task is created.
          */
         Request( Media& media )
         {
@@ -294,7 +365,8 @@ public:
             m_cbs = {};
             m_cbs.version = 0;
             m_cbs.on_parsed = CallbackWrapper<(unsigned int)CallbackIdx::OnParsed,
-                              decltype(libvlc_parser_cbs::on_parsed)>::wrap<Parser::Task, Parser::Status>(
+                              decltype(libvlc_parser_cbs::on_parsed)>::wrap<
+                              Parser::TaskIdentifier, Parser::Status>(
                               *m_callbacks, std::forward<OnParsedCb>( onParsedCb ) );
         }
 
@@ -329,7 +401,7 @@ public:
          *
          * \param media the media for which to generate thumbnails
          *
-         * \warning The media object must remain valid until the thumnailer request is queued.
+         * \warning The media object must remain valid until the thumbnailer task is created.
          */
         ThumbnailerRequest( Media& media )
         {
@@ -455,7 +527,8 @@ public:
             m_cbs = {};
             m_cbs.version = 0;
             m_cbs.on_ended = CallbackWrapper<(unsigned int)CallbackIdx::OnThumbnailerEnded,
-                             decltype(libvlc_thumbnailer_cbs::on_ended)>::wrap<Parser::Task, Picture>(
+                             decltype(libvlc_thumbnailer_cbs::on_ended)>::wrap<
+                             Parser::TaskIdentifier, Picture>(
                              *m_callbacks, std::forward<OnThumbnailerEnded>( onThumbnailerEnded ) );
         }
     };
@@ -476,74 +549,122 @@ public:
     }
 
     /**
-     * Queue a parsing request.
+     * Create a media parsing task.
+     *
+     * Nothing runs and no callback can fire until the returned Task is
+     * passed to submit().
      *
      * \param request the parsing request
      * \param cbs pre-built \ref Parser::Callbacks object
-     * \return the queued task \ref TaskIdentifier that can be used to identify the
-     * task in callbacks and to cancel the task if needed
+     * \return the created \ref Task, to pass to submit(). Its
+     * Task::id() identifies the task in callbacks.
      *
      * \warning The application must ensure that the Callbacks object supplied
-     * remains valid and unmodified until the parser request terminates and the onParsedCb callback is called
-     * on that Task (the returned TaskIdentifier can be used to identify the Task in the onParsedCb
-     * using ==).
-     *
-     * \warning The returned TaskIdentifier is only valid till the parser request finishes
-     * and the onParsedCb callback is called, after that it should not be used anymore
-     * as the underlying task object is released by libVLC and the TaskIdentifier will hold a
-     * dangling pointer.
+     * remains valid and unmodified until the onParsedCb callback is called for
+     * the submitted task.
      */
-    TaskIdentifier queue( const Request& request, const Callbacks& cbs )
+    Task createParseTask( const Request& request, const Callbacks& cbs )
     {
-        auto task = libvlc_parser_queue( *this, &request.m_req, &cbs.m_cbs, cbs.m_callbacks.get() );
+        auto task = libvlc_parser_task_new_parse( *this, &request.m_req, &cbs.m_cbs, cbs.m_callbacks.get() );
         if ( task == nullptr )
-            throw std::runtime_error( "Failed to queue parser task" );
-        return TaskIdentifier( task );
+            throw std::runtime_error( "Failed to create parser task" );
+        return Task( m_obj, task );
     }
 
     /**
-     * Queue a thumbnail generation request.
+     * Create a thumbnail generation task.
+     *
+     * Nothing runs and no callback can fire until the returned Task is
+     * passed to submit().
      *
      * \param request the thumbnail generation request
      * \param cbs pre-built \ref Parser::ThumbnailerCallbacks object
-     * \return the queued task \ref TaskIdentifier that can be used to identify the
-     * task in callbacks and to cancel the task if needed
+     * \return the created \ref Task, to pass to submit(). Its
+     * Task::id() identifies the task in callbacks.
      *
      * \warning The application must ensure that the ThumbnailerCallbacks object supplied
-     * remains valid and unmodified until the request terminates and the onThumbnailerEnded callback is called
-     * on that Task (the returned TaskIdentifier can be used to identify the Task in the onThumbnailerEnded
-     * callback using ==).
-     *
-     * \warning The returned TaskIdentifier is only valid till the thumbnailer request finishes
-     * and the onThumbnailerEnded callback is called, after that it should not be used anymore
-     * as the underlying task object is released by libVLC and the TaskIdentifier will hold a dangling pointer.
+     * remains valid and unmodified until the onThumbnailerEnded callback is called for
+     * the submitted task.
      */
-    TaskIdentifier queueThumbnailing( const ThumbnailerRequest& request, const ThumbnailerCallbacks& cbs )
+    Task createThumbnailTask( const ThumbnailerRequest& request,
+                                     const ThumbnailerCallbacks& cbs )
     {
-        auto task = libvlc_parser_queue_thumbnailing( *this, &request.m_req, &cbs.m_cbs, cbs.m_callbacks.get() );
+        auto task = libvlc_parser_task_new_thumbnail( *this, &request.m_req, &cbs.m_cbs,
+                                                      cbs.m_callbacks.get() );
         if ( task == nullptr )
-            throw std::runtime_error( "Failed to queue thumbnailer task" );
-        return TaskIdentifier( task );
+            throw std::runtime_error( "Failed to create thumbnailer task" );
+        return Task( m_obj, task );
+    }
+
+    /**
+     * Start a task created by createParseTask() or createThumbnailTask().
+     *
+     * On success the task is scheduled and its completion callback is guaranteed
+     * to be called exactly once, including when the task is cancelled. That
+     * callback may run, on another thread, even before this function returns:
+     * fetch Task::id() before submitting to identify the task in its
+     * callbacks.
+     *
+     * \param task a task created by this parser that has not been submitted yet
+     * \return the \ref SubmittedTask, which can be used to cancel the task
+     *
+     * \throws std::logic_error if the task was already submitted
+     * \throws std::invalid_argument if the task was created by another parser
+     * \throws std::runtime_error if the task could not be submitted
+     *
+     * \note On success \p task is consumed and left empty. On error no
+     * callback is invoked, \p task is left untouched and may be submitted again.
+     */
+    SubmittedTask submit( Task&& task )
+    {
+        if ( task.m_task == nullptr )
+            throw std::logic_error( "Parser task was already submitted" );
+
+        /* Ensures whether the task was created by this parser.
+           Comparing libvlc_parser_t addresses isn't enough. Once the task's parser
+           is destroyed, a new parser can reuse the same address, and the stale task
+           would be submitted to a parser that didn't create it (UB in libVLC).
+           owner_before() compares shared_ptr control blocks instead. It ensures that
+           the task was created by this parser and rejects every other parser,
+           even if it reuses the same address. */
+        if ( m_obj.owner_before( task.m_parser ) || task.m_parser.owner_before( m_obj ) )
+            throw std::invalid_argument( "Parser task was created by another parser" );
+        if ( libvlc_parser_submit( *this, task.m_task.get() ) != 0 )
+            throw std::runtime_error( "Failed to submit parser task" );
+
+        return SubmittedTask( std::move( task.m_task ) );
     }
 
     /**
      * Cancel a parser request.
      *
-     * \param task the task to cancel \ref TaskIdentifier
+     * If the task already terminated, this is a no-op and no callback is
+     * invoked. An empty Task cancels nothing.
+     *
+     * \param task the task to cancel \ref SubmittedTask
      * \return the number of cancelled tasks
      *
-     * \warning The TaskIdentifier supplied must be valid and not expired,
-     * otherwise the behavior is undefined.
+     * \warning The completion callback of the cancelled task may be invoked
+     * synchronously from this call, on the calling thread. Don't hold a lock
+     * that the callback also takes while calling this function.
      */
-    size_t cancelRequest( TaskIdentifier& task )
+    size_t cancelRequest( const SubmittedTask& task )
     {
-        return libvlc_parser_cancel_request( *this, task.m_task );
+        /* libvlc cancels all tasks when given a NULL, so check
+           it early to avoid passing nullptr from an empty Task */
+        if ( !task.isValid() )
+            return 0;
+        return libvlc_parser_cancel_request( *this, task );
     }
 
     /**
      * Cancel all parser requests.
      *
      * \return the number of cancelled tasks
+     *
+     * \warning The completion callbacks of the cancelled tasks may be invoked
+     * synchronously from this call, on the calling thread. Don't hold a lock
+     * that the callbacks also take while calling this function.
      */
     size_t cancelAll()
     {

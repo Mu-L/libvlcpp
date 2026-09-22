@@ -2,8 +2,8 @@
 url = https://code.videolan.org/videolan/vlc.git
 depth = 1
 
-# Jun 28 2026
-revision = 266f1fe08a8bce490c51d830262f0b965b12c698
+# Sep 16 2026
+revision = 778ec071ff216602f2a6e4ddd522dfdb6b791472
 
 [provide]
 libvlc = libvlc_dep
